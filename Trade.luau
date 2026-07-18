@@ -1,0 +1,363 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+-- Player-to-player trading with a dual-confirm ("both ready") escrow flow. The
+-- server is the sole authority: it holds every live session in memory (never
+-- persisted), validates ownership at each step, and swaps items atomically only
+-- once BOTH players have marked ready against an unchanged pair of offers. Any
+-- edit to either offer un-readies both sides, so nobody can slip an item away
+-- after their partner has committed. All state is server-side; the client
+-- (ClientTemplates.TradeMenu) is a thin view driven by the remotes registered in
+-- Start. Started automatically by Server:Start when this module sits beside it.
+--
+-- Offers are keyed by item UUID: an offer is a map { [itemId] = amount } naming
+-- the exact instances to hand over (amount defaults to the whole stack; a smaller
+-- amount splits it). The swap moves those instances via Inventory:TransferItemTo,
+-- so per-instance data (a note's Sector, a weapon's rolled stats) crosses the
+-- trade intact rather than being re-rolled.
+local Trade = {
+	Sessions = {}, -- sessionId -> session
+	PlayerSession = {}, -- player -> sessionId
+	Requests = {}, -- targetPlayer -> { [fromPlayer] = { Expiry } } (a target may hold several)
+}
+
+if RunService:IsClient() then
+	warn("Trade is a server module and is not meant to be required on the client.")
+	return Trade
+end
+
+-- How long a pending trade invite stays open before it lapses.
+local REQUEST_TTL = 30
+
+local function getServer()
+	return require(script.Parent.Server)
+end
+
+local function otherPlayer(session, player)
+	return if session.A == player then session.B else session.A
+end
+
+-- Validate a raw offer (a map { [itemId] = amount }) against what `player` owns,
+-- returning a clean map { [itemId] = amount } or nil + reason. Rejects the whole
+-- offer if any uuid isn't in the player's inventory or the amount exceeds that
+-- instance's stack, so an offer never promises items the player can't back.
+local function sanitizeOffer(player, raw)
+	local Server = getServer()
+	local inventory = Server:GetInventory(player)
+	if not inventory then
+		return nil, "NoInventory"
+	end
+	local map = {}
+	if type(raw) ~= "table" then
+		return map, nil
+	end
+
+	for uuid, rawAmount in raw do
+		if type(uuid) ~= "string" then
+			continue
+		end
+		local amount = math.floor(tonumber(rawAmount) or 0)
+		if amount <= 0 then
+			continue
+		end
+		local item = inventory:GetItem(uuid)
+		if not item then
+			return nil, "InvalidItem"
+		end
+		if amount > (item.Amount or 0) then
+			return nil, "Insufficient"
+		end
+		map[uuid] = amount
+	end
+	return map, nil
+end
+
+-- Resolve an offer map { [itemId] = amount } into wire entries
+-- { {ID, ItemName, Amount}, ... }, looking each instance's name up in the
+-- offerer's inventory so the partner's client can render it (a client can't read
+-- the other player's inventory directly).
+local function offerEntries(player, offerMap)
+	local inventory = getServer():GetInventory(player)
+	local entries = {}
+	for uuid, amount in offerMap or {} do
+		local item = inventory and inventory:GetItem(uuid)
+		if item then
+			table.insert(entries, { ID = uuid, ItemName = item.ItemName, Amount = amount })
+		end
+	end
+	return entries
+end
+
+-- Per-player view of a session (each side sees its own offer as "Yours").
+local function snapshotFor(session, player)
+	local other = otherPlayer(session, player)
+	return {
+		SessionId = session.ID,
+		Partner = other,
+		PartnerName = other.DisplayName,
+		YourOffer = offerEntries(player, session.Offer[player]),
+		TheirOffer = offerEntries(other, session.Offer[other]),
+		YourReady = session.Ready[player] == true,
+		TheirReady = session.Ready[other] == true,
+	}
+end
+
+local function broadcast(session, event)
+	local Server = getServer()
+	Server:FireClient(session.A, event, snapshotFor(session, session.A))
+	Server:FireClient(session.B, event, snapshotFor(session, session.B))
+end
+
+-- Tear a session down and tell both sides why. Safe to call once per session.
+local function endSession(session, reason, success)
+	if not Trade.Sessions[session.ID] then
+		return
+	end
+	Trade.Sessions[session.ID] = nil
+	if Trade.PlayerSession[session.A] == session.ID then
+		Trade.PlayerSession[session.A] = nil
+	end
+	if Trade.PlayerSession[session.B] == session.ID then
+		Trade.PlayerSession[session.B] = nil
+	end
+	local Server = getServer()
+	local payload = { Reason = reason, Success = success == true }
+	Server:FireClient(session.A, "_TradeEnd", payload)
+	Server:FireClient(session.B, "_TradeEnd", payload)
+end
+
+-- Any offer edit clears both readies, so a ready always reflects the exact pair of
+-- offers on screen — nobody can commit and then alter their side.
+local function resetReady(session)
+	session.Ready[session.A] = false
+	session.Ready[session.B] = false
+end
+
+-- Swap items once both sides are ready. Re-validates ownership under the live
+-- inventory first (items may have moved since ready), and on any shortfall aborts
+-- the swap, un-readies both, and reports it rather than paying out partially.
+-- Spends both sides before granting either, so a swap never grants without first
+-- taking the matching cost.
+local function tryExecute(session)
+	if not (session.Ready[session.A] and session.Ready[session.B]) then
+		return
+	end
+	local Server = getServer()
+	local invA = Server:GetInventory(session.A)
+	local invB = Server:GetInventory(session.B)
+	if not invA or not invB then
+		endSession(session, "PlayerLeft", false)
+		return
+	end
+
+	for player, inventory in { [session.A] = invA, [session.B] = invB } do
+		for uuid, amount in session.Offer[player] do
+			local item = inventory:GetItem(uuid)
+			if not item or (item.Amount or 0) < amount then
+				resetReady(session)
+				broadcast(session, "_TradeUpdate")
+				Server:FireClient(player, "_TradeError", { Reason = "Insufficient" })
+				return
+			end
+		end
+	end
+
+	-- Cross the offers by moving the exact instances (data preserved): A's uuids to
+	-- B, B's uuids to A. Each transfer mutates only inventory state, not the offer
+	-- maps we iterate, so this is safe.
+	for uuid, amount in session.Offer[session.A] do
+		invA:TransferItemTo(uuid, amount, invB, "Trade")
+	end
+	for uuid, amount in session.Offer[session.B] do
+		invB:TransferItemTo(uuid, amount, invA, "Trade")
+	end
+
+	endSession(session, "Completed", true)
+end
+
+-- player requests to trade with `target` (a Player instance). Opens a pending
+-- invite the target answers via _TradeRespond; expires after REQUEST_TTL. A target
+-- can hold several pending invites at once (keyed by sender), so a queue of
+-- invitations on the client is backed by distinct server-side entries.
+function Trade.request(player, target)
+	if typeof(target) ~= "Instance" or not target:IsA("Player") or target == player then
+		return { Success = false, Reason = "InvalidTarget" }
+	end
+	if Trade.PlayerSession[player] or Trade.PlayerSession[target] then
+		return { Success = false, Reason = "Busy" }
+	end
+
+	local pending = Trade.Requests[target]
+	if not pending then
+		pending = {}
+		Trade.Requests[target] = pending
+	end
+	pending[player] = { Expiry = os.time() + REQUEST_TTL }
+	getServer():FireClient(target, "_TradeInvite", {
+		From = player,
+		FromName = player.DisplayName,
+		-- So the client's countdown bar matches the server's actual TTL.
+		Duration = REQUEST_TTL,
+	})
+
+	-- Lapse this specific invite if it's still unanswered after the TTL.
+	task.delay(REQUEST_TTL, function()
+		local reqs = Trade.Requests[target]
+		local entry = reqs and reqs[player]
+		if entry and os.time() >= entry.Expiry then
+			reqs[player] = nil
+			if next(reqs) == nil then
+				Trade.Requests[target] = nil
+			end
+			getServer():FireClient(player, "_TradeDeclined", { By = target, Reason = "Expired" })
+		end
+	end)
+
+	return { Success = true }
+end
+
+-- `player` answers a pending invite from `fromPlayer`. On accept, and while both
+-- are still free and present, a session opens for both.
+function Trade.respond(player, fromPlayer, accept)
+	local reqs = Trade.Requests[player]
+	local pending = reqs and reqs[fromPlayer]
+	if not pending then
+		return { Success = false, Reason = "NoRequest" }
+	end
+	reqs[fromPlayer] = nil
+	if next(reqs) == nil then
+		Trade.Requests[player] = nil
+	end
+
+	if not accept then
+		getServer():FireClient(fromPlayer, "_TradeDeclined", { By = player, Reason = "Declined" })
+		return { Success = true }
+	end
+
+	if typeof(fromPlayer) ~= "Instance" or not fromPlayer:IsA("Player") or not fromPlayer.Parent then
+		return { Success = false, Reason = "PlayerLeft" }
+	end
+	if Trade.PlayerSession[player] or Trade.PlayerSession[fromPlayer] then
+		return { Success = false, Reason = "Busy" }
+	end
+
+	local session = {
+		ID = HttpService:GenerateGUID(false),
+		A = fromPlayer,
+		B = player,
+		Offer = { [fromPlayer] = {}, [player] = {} },
+		Ready = { [fromPlayer] = false, [player] = false },
+	}
+	Trade.Sessions[session.ID] = session
+	Trade.PlayerSession[fromPlayer] = session.ID
+	Trade.PlayerSession[player] = session.ID
+
+	broadcast(session, "_TradeStart")
+	return { Success = true }
+end
+
+local function sessionOf(player)
+	local id = Trade.PlayerSession[player]
+	return id and Trade.Sessions[id] or nil
+end
+
+-- Replace `player`'s offer with a validated version and un-ready both sides.
+function Trade.setOffer(player, rawOffer)
+	local session = sessionOf(player)
+	if not session then
+		return { Success = false, Reason = "NoSession" }
+	end
+	local offer, reason = sanitizeOffer(player, rawOffer)
+	if not offer then
+		return { Success = false, Reason = reason }
+	end
+	session.Offer[player] = offer
+	resetReady(session)
+	broadcast(session, "_TradeUpdate")
+	return { Success = true }
+end
+
+-- Toggle `player`'s ready flag. Marking ready re-checks they still own their whole
+-- offer; when both are ready the swap runs immediately.
+function Trade.setReady(player, ready)
+	local session = sessionOf(player)
+	if not session then
+		return { Success = false, Reason = "NoSession" }
+	end
+	ready = ready == true
+
+	if ready then
+		local Server = getServer()
+		local inventory = Server:GetInventory(player)
+		if not inventory then
+			return { Success = false, Reason = "NoInventory" }
+		end
+		for uuid, amount in session.Offer[player] do
+			local item = inventory:GetItem(uuid)
+			if not item or (item.Amount or 0) < amount then
+				return { Success = false, Reason = "Insufficient" }
+			end
+		end
+	end
+
+	session.Ready[player] = ready
+	broadcast(session, "_TradeUpdate")
+	tryExecute(session)
+	return { Success = true }
+end
+
+-- Either party cancels; the session ends for both.
+function Trade.cancel(player)
+	local session = sessionOf(player)
+	if not session then
+		return { Success = false, Reason = "NoSession" }
+	end
+	endSession(session, "Cancelled", false)
+	return { Success = true }
+end
+
+-- Clean up when a player leaves: end their live session and drop any invite they
+-- sent or were sent.
+function Trade.playerLeft(player)
+	local session = sessionOf(player)
+	if session then
+		endSession(session, "PlayerLeft", false)
+	end
+	-- Drop invites sent TO this player, and invites this player sent to anyone.
+	Trade.Requests[player] = nil
+	for target, reqs in Trade.Requests do
+		reqs[player] = nil
+		if next(reqs) == nil then
+			Trade.Requests[target] = nil
+		end
+	end
+end
+
+function Trade.Start()
+	if Trade.Started then
+		return
+	end
+	Trade.Started = true
+	local Server = getServer()
+
+	Server:SetRemoteResponse("_TradeRequest", function(player, target)
+		return Trade.request(player, target)
+	end)
+	Server:SetRemoteResponse("_TradeRespond", function(player, fromPlayer, accept)
+		return Trade.respond(player, fromPlayer, accept)
+	end)
+	Server:SetRemoteResponse("_TradeSetOffer", function(player, offer)
+		return Trade.setOffer(player, offer)
+	end)
+	Server:SetRemoteResponse("_TradeSetReady", function(player, ready)
+		return Trade.setReady(player, ready)
+	end)
+	Server:SetRemoteResponse("_TradeCancel", function(player)
+		return Trade.cancel(player)
+	end)
+
+	Players.PlayerRemoving:Connect(Trade.playerLeft)
+end
+
+return Trade
