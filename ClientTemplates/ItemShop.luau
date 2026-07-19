@@ -13,10 +13,17 @@ local Inventory = require(script.Parent.Parent.Inventory)
 -- shortcut, bound while a shop is open and unbound on close (see Open/Close).
 local CLOSE_ACTION = "ItemShopClose"
 
--- Registered with the game's Client menu system under this underscore-prefixed name
--- (so it can't clash with a game menu). Open/Close route through
--- Client:SetMenu/CloseMenu, so opening a game menu closes the shop and vice versa.
+-- Base of the menu name each shop registers with the game's Client menu system
+-- (an underscore prefix keeps it from clashing with a game menu). Open/Close route
+-- through Client:SetMenu/CloseMenu, so opening a game menu closes the shop and vice
+-- versa. Each ItemShop instance gets its OWN suffixed name (see the counter below):
+-- a game may create several shop instances (one per pad/NPC), and the menu system
+-- keys menus by name — a shared name would make every instance clobber the same
+-- menu registration, so opening one pad would show another's (empty) panel.
 local MENU_NAME = "_ItemShop"
+
+-- Monotonic id handed to each new instance so its menu name is unique.
+local nextInstanceId = 0
 
 -- Shop UI for the data registered server-side via Server:AddShopInfo. A project
 -- opts in with `require(...ClientTemplates.ItemShop).new()` and then calls
@@ -194,6 +201,7 @@ function ItemShop:_createRow(index, trade)
 		Button = button,
 		TradeAllButton = tradeAllButton,
 		Costs = costs,
+		Trade = trade,
 		Index = index,
 		BaseColor = button.BackgroundColor3,
 		Affordable = true,
@@ -208,6 +216,10 @@ function ItemShop:_createRow(index, trade)
 		if result and not result.Success then
 			warn("Shop trade failed: " .. tostring(result.Reason))
 		end
+		-- Re-evaluate rows now that the server has applied the trade, so affordability
+		-- and any TradeFilter (e.g. "hide once owned"/"hide when none left") update
+		-- immediately instead of waiting for the next Heartbeat refresh.
+		self:_refresh()
 	end)
 
 	tradeAllButton.Activated:Connect(function()
@@ -218,6 +230,7 @@ function ItemShop:_createRow(index, trade)
 		if result and not result.Success then
 			warn("Shop trade failed: " .. tostring(result.Reason))
 		end
+		self:_refresh()
 	end)
 
 	return row, record
@@ -228,6 +241,20 @@ function ItemShop:_refresh()
 	local inventory = Client.Inventory
 	local anyAffordable = false
 	for _, record in self.Rows do
+		-- A dynamic TradeFilter (see .new) decides, per player and re-evaluated every
+		-- refresh, whether a trade is shown — e.g. hiding a pickaxe purchase once it's
+		-- owned. A hidden row is fully inert: not shown, not counted as affordable, and
+		-- never eligible for "trade all". (The static trade.Hidden flag drops a row at
+		-- build time instead; this is the live per-player counterpart.)
+		if self.TradeFilter and not self.TradeFilter(record.Trade, record.Index) then
+			record.Row.Visible = false
+			record.Affordable = false
+			record.CanTradeAll = false
+			record.TradeAllButton.Visible = false
+			continue
+		end
+		record.Row.Visible = true
+
 		-- Max copies of this trade the player can afford, bounded by the scarcest
 		-- cost item (matching the server's `true`/"trade all" computation). A trade
 		-- with no costs has no such bound — always affordable, never "trade all".
@@ -283,6 +310,13 @@ function ItemShop:_build()
 	local shop = Client.ShopTable and Client.ShopTable[self.ShopId]
 	local trades = shop and shop.Trades or {}
 	for index, trade in trades do
+		-- A trade flagged Hidden is left out of the UI entirely (no row, so it's never
+		-- listed or counted for affordability/mass-trade). Its position in the Trades
+		-- array — and therefore its trade index — is untouched, so the server can still
+		-- run it by index if a game triggers it directly.
+		if trade.Hidden then
+			continue
+		end
 		local row, record = self:_createRow(index, trade)
 		row.Parent = self.List
 		table.insert(self.Rows, record)
@@ -312,7 +346,7 @@ function ItemShop:Open(shopId)
 
 	self:_build()
 	self:_refresh()
-	Client:SetMenu(MENU_NAME)
+	Client:SetMenu(self.MenuName)
 end
 
 function ItemShop:Close()
@@ -320,7 +354,7 @@ function ItemShop:Close()
 	self.Rows = {}
 	-- Only close if the shop is the active menu, so we never yank a game menu the
 	-- player has since switched to.
-	if Client.CurrentMenu == MENU_NAME then
+	if Client.CurrentMenu == self.MenuName then
 		Client:CloseMenu()
 	end
 end
@@ -356,11 +390,11 @@ function ItemShop:Destroy()
 	-- Drop the gamepad focus / B-binding first, in case we're torn down while open.
 	self:_teardownInput()
 	-- Drop our menu registration so the game's RenderUI stops touching a destroyed GUI.
-	if Client.Menus[MENU_NAME] and Client.Menus[MENU_NAME].Instance == self.Gui then
-		if Client.CurrentMenu == MENU_NAME then
+	if Client.Menus[self.MenuName] and Client.Menus[self.MenuName].Instance == self.Gui then
+		if Client.CurrentMenu == self.MenuName then
 			Client:CloseMenu()
 		end
-		Client.Menus[MENU_NAME] = nil
+		Client.Menus[self.MenuName] = nil
 	end
 	if self.Connection then
 		self.Connection:Disconnect()
@@ -376,6 +410,17 @@ function ItemShop.new(config)
 	local self = setmetatable({}, ItemShop)
 	self.Rows = {}
 	self.TradeName = config.TradeName or "Trade"
+
+	-- Optional per-player, live trade filter: filter(trade, index) -> boolean, called
+	-- for every row on each refresh while the shop is open. Return false to hide the
+	-- trade (e.g. a pickaxe already owned), true to show it. Re-evaluated continuously,
+	-- so a trade appears/disappears as the player's inventory changes.
+	self.TradeFilter = config.TradeFilter
+
+	-- Unique per-instance menu name so multiple shops (e.g. a Buy pad and a Sell pad)
+	-- each register their own menu instead of overwriting a shared one.
+	nextInstanceId += 1
+	self.MenuName = MENU_NAME .. "_" .. nextInstanceId
 
 	self.Gui = Instance.new("ScreenGui")
 	self.Gui.Name = "ItemShop"
@@ -464,6 +509,8 @@ function ItemShop.new(config)
 		if result and not result.Success then
 			warn("Shop mass trade failed: " .. tostring(result.Reason))
 		end
+		-- Refresh immediately post-trade so filters/affordability reflect the result.
+		self:_refresh()
 	end)
 
 	self.MassTradeButton = massTradeButton
@@ -500,12 +547,12 @@ function ItemShop.new(config)
 
 	-- Register with the game's menu system; RenderUI now owns this GUI's Enabled /
 	-- parenting based on Client.CurrentMenu.
-	Client:CreateMenu(MENU_NAME, self.Gui)
+	Client:CreateMenu(self.MenuName, self.Gui)
 
 	self.Connection = RunService.Heartbeat:Connect(function()
 		-- Track menu shown/hidden transitions so gamepad input setup/teardown runs
 		-- however the shop was opened or closed (our Open/Close, another SetMenu, etc.).
-		local shown = Client.CurrentMenu == MENU_NAME
+		local shown = Client.CurrentMenu == self.MenuName
 		if shown ~= self._shown then
 			self._shown = shown
 			if shown then

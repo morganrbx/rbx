@@ -18,6 +18,12 @@ local Server = {
 	RemoteEvent = Instance.new("RemoteEvent"),
 	RemoteFunction = Instance.new("RemoteFunction"),
 
+	-- Player-to-player trading is OFF unless a game opts in with Server:EnableTrading.
+	-- The Trade module ships with the package, but its remotes are only registered
+	-- when this is true (see Server:Start), so a game that doesn't want players moving
+	-- items between each other never exposes the trade backend.
+	TradingEnabled = false,
+
 	EventResponses = {},
 	EventConnections = {},
 }
@@ -161,6 +167,24 @@ function Server:AddShopInfo(shopTable)
 	end
 end
 
+-- Register a server-side guard that can veto individual shop trades. `callback` is
+-- called as callback(player, shopId, trade, inventory) right before a trade (or each
+-- sub-trade of a mass trade) executes; return false to reject it, true to allow. This
+-- is the authoritative counterpart to the client ItemShop's TradeFilter — use it to
+-- enforce a hide rule that must not be bypassable (e.g. "can't buy a pickaxe you
+-- already own"). A single guard covers every shop; branch on shopId/trade inside it.
+function Server:SetShopTradeGuard(callback)
+	self.ShopTradeGuard = callback
+end
+
+-- Opt into player-to-player trading (see Trade.luau). Trading is OFF by default, so
+-- the trade remotes aren't registered and no items can move between players unless a
+-- game calls this. Call before Server:Start (Start reads the flag when deciding
+-- whether to start the Trade module).
+function Server:EnableTrading()
+	self.TradingEnabled = true
+end
+
 local DAY_SECONDS = 86400
 
 -- Register the daily play-time reward tiers. `rewards` is a map keyed by the
@@ -274,6 +298,9 @@ local TOOL_ATTRIBUTE = "hex_wiretool"
 -- after the item's unique ID and stamped with TOOL_ATTRIBUTE); destroy any stamped
 -- tool whose item has left the inventory. Equipped tools live in the Character, not
 -- the Backpack, so both are searched — a still-owned equipped tool is left in place.
+-- A ToolFilter (see WireTools) can further narrow the wired set — e.g. wiring only
+-- the single best pickaxe a player owns — and, because this runs on every inventory
+-- change, the wired tools stay in sync as items are gained or spent.
 function Server:_reconcileTools(player)
 	local folder = self.ToolsFolder
 	local entry = self.Players[player]
@@ -281,10 +308,16 @@ function Server:_reconcileTools(player)
 		return
 	end
 
+	local items = entry.State:Get("_Inventory/Items") or {}
 	local desired = {} -- itemID -> ItemName
-	for id, item in entry.State:Get("_Inventory/Items") or {} do
+	for id, item in items do
 		if type(item) == "table" and item.ItemName and folder:FindFirstChild(item.ItemName) then
-			desired[id] = item.ItemName
+			-- The optional filter gets the candidate item and the whole inventory, so
+			-- it can decide relative to the other items owned (e.g. "is this the best
+			-- pickaxe?"). No filter means every matching item is wired, as before.
+			if not self.ToolFilter or self.ToolFilter(player, item, items) then
+				desired[id] = item.ItemName
+			end
 		end
 	end
 
@@ -316,6 +349,11 @@ function Server:_reconcileTools(player)
 				local tool = folder[itemName]:Clone()
 				tool.Name = id
 				tool:SetAttribute(TOOL_ATTRIBUTE, true)
+				-- Give the tool its backpack/hotbar icon from the item's Render.Image,
+				-- so a tool template authored without a TextureId still shows the same
+				-- icon the item uses everywhere else. Falls back to "" (no icon).
+				local info = self.Items[itemName]
+				tool.TextureId = (info and info.Render and info.Render.Image) or ""
 				tool.Parent = backpack
 			end
 		end
@@ -354,8 +392,17 @@ end
 
 -- folder: an Instance holding Tool templates keyed by ItemName (e.g. a Tools
 -- folder in ReplicatedStorage). Applies to current and future players.
-function Server:WireTools(folder)
+--
+-- filter (optional): filter(player, item, items) -> boolean, called for every
+-- inventory item whose ItemName matches a template in `folder`. Return true to wire
+-- a Tool for that item, false to skip it. `item` is the candidate item table and
+-- `items` is the player's whole `_Inventory/Items` map, so the decision can be made
+-- relative to the rest of the inventory (e.g. wire only the highest-Power pickaxe).
+-- It runs during reconciliation, which fires on every item gain/spend and on
+-- respawn, so the wired set follows the filter automatically.
+function Server:WireTools(folder, filter)
 	self.ToolsFolder = folder
+	self.ToolFilter = filter
 	for player in self.Players do
 		self:_setupTools(player)
 	end
@@ -399,6 +446,13 @@ local function processShopTrade(player, shopId, tradeIndex, quantity)
 		if not Server.Items[entry[1]] then
 			return { Success = false, Reason = "InvalidGiveItem" }
 		end
+	end
+
+	-- A game-supplied guard can veto specific trades server-side (see
+	-- Server:SetShopTradeGuard) — the authoritative counterpart to the client
+	-- ItemShop's TradeFilter, so a hide rule can't be bypassed by a crafted request.
+	if Server.ShopTradeGuard and not Server.ShopTradeGuard(player, shopId, trade, inventory) then
+		return { Success = false, Reason = "Blocked" }
 	end
 
 	-- Aggregate per item so duplicate cost rows (two {"Coins", 10}) require the
@@ -500,6 +554,11 @@ local function processMassTrade(player, shopId)
 	local totalCount = 0
 
 	for _, trade in trades do
+		-- Honour the same server-side guard as single trades: a vetoed trade is simply
+		-- skipped in the mass pass (mass trade does what it's allowed to).
+		if Server.ShopTradeGuard and not Server.ShopTradeGuard(player, shopId, trade, inventory) then
+			continue
+		end
 		local tradeCosts = trade.Cost or {}
 		local gives = trade.Give or {}
 
@@ -640,9 +699,11 @@ function Server:Start()
 	end)
 
 	-- P2P trading (see Trade.luau) registers its own remotes and player-leaving
-	-- cleanup here. Only started when the module is present alongside Server.
+	-- cleanup here. Off by default: only started when the module is present alongside
+	-- Server AND the game opted in via Server:EnableTrading, so the trade backend is
+	-- never exposed unless explicitly wanted.
 	local tradeModule = script.Parent:FindFirstChild("Trade")
-	if tradeModule then
+	if tradeModule and self.TradingEnabled then
 		require(tradeModule).Start()
 	end
 

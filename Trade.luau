@@ -20,6 +20,11 @@ local Trade = {
 	Sessions = {}, -- sessionId -> session
 	PlayerSession = {}, -- player -> sessionId
 	Requests = {}, -- targetPlayer -> { [fromPlayer] = { Expiry } } (a target may hold several)
+
+	-- Max distance (studs) allowed between two players' characters for a trade
+	-- request to open. nil/0 means unlimited (the default, so existing games are
+	-- unaffected); set it with Trade.SetMaxRequestDistance to require proximity.
+	MaxRequestDistance = nil,
 }
 
 if RunService:IsClient() then
@@ -32,6 +37,33 @@ local REQUEST_TTL = 30
 
 local function getServer()
 	return require(script.Parent.Server)
+end
+
+-- Set the proximity requirement for opening a trade request (studs between the two
+-- players' characters). Pass nil or 0 to lift the limit. Read live per request, so
+-- it can be changed at any time.
+function Trade.SetMaxRequestDistance(studs)
+	Trade.MaxRequestDistance = (type(studs) == "number" and studs > 0) and studs or nil
+	-- Replicate the current range to clients (0 = unlimited) so the trade player
+	-- list can filter to who's actually invitable and word its empty state.
+	workspace:SetAttribute("hex_trade_range", Trade.MaxRequestDistance or 0)
+end
+
+-- Whether `a` and `b` are close enough to trade under the current limit. With no
+-- limit set, always true. With a limit, BOTH must have a live character (a player
+-- who isn't in the world can't be "near" anyone), and their root parts must be
+-- within MaxRequestDistance of each other.
+local function withinRequestRange(a, b)
+	local maxDist = Trade.MaxRequestDistance
+	if not maxDist then
+		return true
+	end
+	local rootA = a.Character and a.Character:FindFirstChild("HumanoidRootPart")
+	local rootB = b.Character and b.Character:FindFirstChild("HumanoidRootPart")
+	if not rootA or not rootB then
+		return false
+	end
+	return (rootA.Position - rootB.Position).Magnitude <= maxDist
 end
 
 local function otherPlayer(session, player)
@@ -186,6 +218,9 @@ function Trade.request(player, target)
 	end
 	if Trade.PlayerSession[player] or Trade.PlayerSession[target] then
 		return { Success = false, Reason = "Busy" }
+	end
+	if not withinRequestRange(player, target) then
+		return { Success = false, Reason = "TooFar" }
 	end
 
 	local pending = Trade.Requests[target]

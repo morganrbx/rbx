@@ -188,6 +188,13 @@ end
 
 -- ── Player-list panel ────────────────────────────────────────────────────────
 
+-- Friendly wording for the reasons _TradeRequest can fail with.
+local REQUEST_FAIL_MESSAGES = {
+	Busy = "That player is already trading.",
+	TooFar = "Get closer to trade with them.",
+	InvalidTarget = "Can't trade with that player.",
+}
+
 -- Send a trade request to `player` and reflect the result.
 function TradeInvites:_request(player)
 	local result = Client:InvokeServer("_TradeRequest", player)
@@ -195,7 +202,8 @@ function TradeInvites:_request(player)
 		self:_toast("Waiting for " .. player.DisplayName .. "…", ACCENT_COLOR)
 		self:Close()
 	else
-		self:_toast("Couldn't trade: " .. tostring(result and result.Reason), DECLINE_COLOR)
+		local reason = result and result.Reason
+		self:_toast(REQUEST_FAIL_MESSAGES[reason] or ("Couldn't trade: " .. tostring(reason)), DECLINE_COLOR)
 	end
 end
 
@@ -207,16 +215,34 @@ function TradeInvites:_buildList()
 		end
 	end
 
+	-- When a trade range is set (workspace hex_trade_range, replicated by
+	-- Trade.SetMaxRequestDistance), only list players actually invitable from here;
+	-- the server enforces the same range on the request. 0/absent = unlimited.
+	local range = workspace:GetAttribute("hex_trade_range")
+	range = (type(range) == "number" and range > 0) and range or nil
+	local localCharacter = Players.LocalPlayer.Character
+	local localRoot = localCharacter and localCharacter:FindFirstChild("HumanoidRootPart")
+
 	local others = {}
 	for _, player in Players:GetPlayers() do
 		if player ~= Players.LocalPlayer then
-			table.insert(others, player)
+			if range then
+				local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+				if localRoot and root and (localRoot.Position - root.Position).Magnitude <= range then
+					table.insert(others, player)
+				end
+			else
+				table.insert(others, player)
+			end
 		end
 	end
 	table.sort(others, function(a, b)
 		return a.DisplayName < b.DisplayName
 	end)
 
+	-- Empty-state wording reflects whether proximity is required.
+	self.Empty.Text = range and ("No other players within " .. math.floor(range) .. " studs.")
+		or "No other players here."
 	self.Empty.Visible = #others == 0
 
 	for i, player in others do

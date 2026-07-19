@@ -291,6 +291,40 @@ local function formatWeight(weight)
 	return string.format("%.1f", weight)
 end
 
+local function trim(text)
+	return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Parse an item's `Stats` CSV into display lines. The field is authored as one stat
+-- per row (rows split on newlines or semicolons); each row is comma-separated cells.
+-- A two-cell row "Label,Value" renders as "Label: Value"; extra cells join with a
+-- space; a single-cell row renders verbatim. Blank rows/cells are dropped. This lets
+-- a game surface arbitrary gameplay stats (Power, Durability, …) in the native
+-- tooltip just by setting a string on the item — no bespoke UI required.
+local function parseStatsCsv(csv)
+	local lines = {}
+	for _, chunk in string.split(csv:gsub("\r", ""), "\n") do
+		for _, row in string.split(chunk, ";") do
+			if row:match("%S") then
+				local cells = {}
+				for _, cell in string.split(row, ",") do
+					cell = trim(cell)
+					if cell ~= "" then
+						table.insert(cells, cell)
+					end
+				end
+				if #cells == 1 then
+					table.insert(lines, cells[1])
+				elseif #cells >= 2 then
+					local label = table.remove(cells, 1)
+					table.insert(lines, label .. ": " .. table.concat(cells, " "))
+				end
+			end
+		end
+	end
+	return lines
+end
+
 -- Build the styled content frame for an item. Width is fixed; height grows with
 -- the (optional) description and stat lines via AutomaticSize. `itemName` is the
 -- inventory key used for the "You own" line; pass nil to omit it.
@@ -372,9 +406,22 @@ local function buildItemFrame(info, amount, itemName)
 		description.Parent = frame
 	end
 
+	-- Author-supplied gameplay stats (see parseStatsCsv), shown as their own block
+	-- above the value/weight line. Static — they describe the item, not the stack —
+	-- so they're built once and never touched by the amount refresh below.
+	if type(info.Stats) == "string" and info.Stats ~= "" then
+		local lines = parseStatsCsv(info.Stats)
+		if #lines > 0 then
+			local customStats = createTextLabel(table.concat(lines, "\n"), STAT_COLOR, 13)
+			customStats.Name = "CustomStats"
+			customStats.LayoutOrder = 3
+			customStats.Parent = frame
+		end
+	end
+
 	local stats = createTextLabel("", STAT_COLOR, 13)
 	stats.Name = "Stats"
-	stats.LayoutOrder = 3
+	stats.LayoutOrder = 4
 	stats.Parent = frame
 
 	-- The name's count and the value/weight stats are the only amount-dependent
@@ -416,7 +463,7 @@ local function buildItemFrame(info, amount, itemName)
 	if itemName then
 		local owned = createTextLabel("", BODY_COLOR, 13)
 		owned.Name = "Owned"
-		owned.LayoutOrder = 4
+		owned.LayoutOrder = 5
 		owned.Parent = frame
 
 		function refreshOwned()
