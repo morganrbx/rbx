@@ -1,36 +1,91 @@
 local TableUtil = require(script.Parent.TableUtil)
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
+local AnalyticsService = game:GetService("AnalyticsService")
 local Inventory = {}
 Inventory.__index = Inventory
 local inventories = {}
 
--- Notify the inventory's owner that items changed. Fired at the public-operation
--- level (GiveItem/SpendItem) rather than per internal Set, so a grant that fills
--- several stacks still produces a single, correctly-aggregated toast. Owner-only:
--- ownerless (chest/shared) inventories stay silent. kind is "Added" | "Removed".
--- `source` (optional) tags what caused the change (e.g. "Trade"); it rides along
--- in the payload so a client-side ItemNotifications Filter can suppress toasts from
--- a particular source without dropping ordinary pickups.
-local function notify(state, kind, itemName, amount, source)
+-- Valid AnalyticsEconomyTransactionType names, so an arbitrary `source` string
+-- (e.g. "Fishing", "Trade") that isn't a transaction type is classified cleanly
+-- instead of erroring when we log an economy event.
+local VALID_TRANSACTION = {}
+for _, item in ipairs(Enum.AnalyticsEconomyTransactionType:GetEnumItems()) do
+	VALID_TRANSACTION[item.Name] = true
+end
+
+-- Resolve the transaction type for an economy event: prefer the call's `source`
+-- when it names a real transaction type, else the item's registered default, else
+-- Gameplay.
+local function transactionTypeFor(source, config)
+	if type(source) == "string" and VALID_TRANSACTION[source] then
+		return source
+	end
+	if config.default and VALID_TRANSACTION[config.default] then
+		return config.default
+	end
+	return Enum.AnalyticsEconomyTransactionType.Gameplay.Name
+end
+
+-- Notify the inventory's owner that items changed, and -- for items whitelisted
+-- via Server:TrackEconomy -- log a Roblox economy analytics event. Fired at the
+-- public-operation level (GiveItem/SpendItem/...) rather than per internal Set, so
+-- a grant that fills several stacks still produces a single, correctly-aggregated
+-- toast and a single economy event. Owner-only: ownerless (chest/shared)
+-- inventories stay silent. kind is "Added" | "Removed". `source` (optional) tags
+-- what caused the change (e.g. "Trade"): it rides along in the toast payload so a
+-- client-side ItemNotifications Filter can suppress toasts from a particular
+-- source, and it doubles as the analytics transaction type when it names one.
+-- `skipEconomy` is set by net-zero transfers (TransferItemTo — stash moves, trades) so a
+-- relocation of items is never logged as an economy faucet/sink.
+local function notify(inventory, kind, itemName, amount, source, skipEconomy)
 	if not RunService:IsServer() then
 		return
 	end
+	local state = inventory.State
 	local player = state and state.Player
 	if not player or not amount or amount <= 0 then
 		return
 	end
 	-- One-time migrations grant a whole legacy balance at once; callers set this
-	-- flag around the grant so the port doesn't spam the owner with toasts.
+	-- flag around the grant so the port doesn't spam the owner with toasts -- or
+	-- pollute economy analytics with a migration that isn't a real gain.
 	if state._suppressNotify then
 		return
 	end
-	require(script.Parent.Server):FireClient(player, "_ItemNotification", {
+	local Server = require(script.Parent.Server)
+	Server:FireClient(player, "_ItemNotification", {
 		Kind = kind,
 		ItemName = itemName,
 		Amount = amount,
 		Source = source,
 	})
+
+	-- Economy analytics for whitelisted items (currencies, premium resources, ...).
+	-- LogEconomyEvent is server + published-game only and can throw, so it must
+	-- never be allowed to break the actual inventory change.
+	local config = Server.EconomyItems and Server.EconomyItems[itemName]
+	if config and not skipEconomy then
+		local flowType = if kind == "Added"
+			then Enum.AnalyticsEconomyFlowType.Source
+			else Enum.AnalyticsEconomyFlowType.Sink
+		-- Ending balance is the player's TOTAL holdings of the item. By default that's just
+		-- this inventory, but an item can live in more than one (e.g. Caps also sits in the
+		-- "_Cache" stash) — TrackEconomy's balancePrefixes lists those extra state prefixes
+		-- so the reported balance sums them all rather than under-reporting the stash.
+		local balance = inventory:CountItem(itemName)
+		if config.balancePrefixes then
+			for _, prefix in config.balancePrefixes do
+				if prefix ~= inventory.Prefix then
+					balance += Inventory.get(state, prefix):CountItem(itemName)
+				end
+			end
+		end
+		local transactionType = transactionTypeFor(source, config)
+		pcall(function()
+			AnalyticsService:LogEconomyEvent(player, flowType, itemName, amount, balance, transactionType)
+		end)
+	end
 end
 
 function Inventory.get(state, prefix)
@@ -66,8 +121,15 @@ function Inventory.renderItemImage(imageLabel, itemOrName: {} | string)
 		return
 	end
 	local render = itemInfo.Render
+	-- No icon — no Render table, or an empty Image (the default an ImageLabel/omitted field
+	-- falls back to). Blank the label and stop, rather than crashing on a nil `render` or
+	-- applying an empty image: an iconless item (e.g. a gun awaiting art) reads as an empty
+	-- slot instead of erroring.
+	if not render or (render.Image or "") == "" then
+		imageLabel.Image = ""
+		return
+	end
 	render.ScaleType = render.ScaleType or Enum.ScaleType.Fit
-	render.Image = render.Image or ""
 	render.ImageColor3 = render.ImageColor3 or Color3.new(1, 1, 1)
 	for key, value in render do
 		imageLabel[key] = value
@@ -189,7 +251,7 @@ function Inventory:SpendItem(itemName, amount, source)
 
 	-- Only toast on a fully-successful spend; a partial removal returns false
 	-- above, so we never show a "-N" that contradicts the failed result.
-	notify(self.State, "Removed", itemName, removed, source)
+	notify(self, "Removed", itemName, removed, source)
 	return true
 end
 
@@ -223,8 +285,9 @@ function Inventory:GetItems()
 end
 
 -- `source` (optional) tags the "Added" toast so a client ItemNotifications Filter
--- can suppress it (see SpendItem).
-function Inventory:GiveItem(itemName: string, amount: number?, source: string?)
+-- can suppress it (see SpendItem). `skipEconomy` (optional) suppresses the economy-analytics
+-- Source event — set by net-zero transfers so a relocation isn't logged as a faucet.
+function Inventory:GiveItem(itemName: string, amount: number?, source: string?, skipEconomy: boolean?)
 	if RunService:IsClient() then
 		error("Inventory called a server function")
 	end
@@ -291,7 +354,7 @@ function Inventory:GiveItem(itemName: string, amount: number?, source: string?)
 
 	-- GiveItem always adds the full requested amount (new stacks absorb any
 	-- remainder), so one toast for the whole grant.
-	notify(self.State, "Added", itemName, amount or 1, source)
+	notify(self, "Added", itemName, amount or 1, source, skipEconomy)
 end
 
 function Inventory:GiveItems(items, source)
@@ -333,7 +396,7 @@ function Inventory:AddItem(itemName: string, data: {}?)
 		self.State:Set(self.Prefix .. "/Items/" .. id, item)
 	end
 
-	notify(self.State, "Added", itemName, 1)
+	notify(self, "Added", itemName, 1)
 	return id, item
 end
 
@@ -368,7 +431,7 @@ function Inventory:RemoveItem(id: string)
 		self.State:Set(self.Prefix .. "/Index/" .. item.ItemName, index)
 	end
 
-	notify(self.State, "Removed", item.ItemName, amount)
+	notify(self, "Removed", item.ItemName, amount)
 	return true
 end
 
@@ -377,6 +440,31 @@ end
 -- Safe on client and server (reads replicated state).
 function Inventory:GetItem(id: string)
 	return self.State:Get(self.Prefix .. "/Items/" .. id)
+end
+
+-- Merge `patch`'s fields into the existing instance `id` and write it back, so the
+-- change replicates and any UI re-renders. For mutating an instance's carried data
+-- in place -- e.g. re-rolling a Note's Sector -- without the remove+re-add churn (a
+-- new id and spurious Added/Removed toasts). Structural keys (ID/ItemName/Amount/
+-- LocalID) are protected, matching AddItem; Amount is untouched, so derived totals
+-- stay correct and no toast is raised. Returns the updated item, or nil if `id` is
+-- unknown.
+function Inventory:UpdateItem(id: string, patch: {})
+	if RunService:IsClient() then
+		error("Inventory called a server function")
+	end
+	local item = self.State:Get(self.Prefix .. "/Items/" .. id)
+	if not item then
+		return nil
+	end
+	local updated = TableUtil.deepCopy(item)
+	for key, value in patch do
+		if key ~= "ID" and key ~= "ItemName" and key ~= "Amount" and key ~= "LocalID" then
+			updated[key] = if typeof(value) == "table" then TableUtil.deepCopy(value) else value
+		end
+	end
+	self.State:Set(self.Prefix .. "/Items/" .. id, updated)
+	return updated
 end
 
 -- Move `amount` of the instance `id` from this inventory into `target`, preserving
@@ -427,12 +515,15 @@ function Inventory:TransferItemTo(id: string, amount: number?, target, source: s
 	end
 	self.State:Increment(self.Prefix .. "/ItemCount", -amount)
 
+	-- A transfer is net-zero for the economy — items relocate, nothing is created or
+	-- destroyed — so every notify below passes skipEconomy=true: the move still toasts, but
+	-- is never logged as an analytics faucet/sink (stash moves and trades both land here).
 	if info and info.Stackable then
 		-- Stackable: merge into the target's existing stacks first (then new stacks as
 		-- needed, respecting StackSize), matching GiveItem. Per-instance data isn't
 		-- meaningful for a stackable item, so it isn't carried here; GiveItem fires the
 		-- target's Added toast (tagged with `source`).
-		target:GiveItem(item.ItemName, amount, source)
+		target:GiveItem(item.ItemName, amount, source, true)
 	else
 		-- Non-stackable: move the exact instance so its custom data crosses intact. A
 		-- fresh uuid avoids duplicating an ID across inventories on a partial move;
@@ -441,10 +532,10 @@ function Inventory:TransferItemTo(id: string, amount: number?, target, source: s
 		moved.ID = HttpService:GenerateGUID(false)
 		moved.Amount = amount
 		createItem(target, moved.ItemName, amount, moved)
-		notify(target.State, "Added", item.ItemName, amount, source)
+		notify(target, "Added", item.ItemName, amount, source, true)
 	end
 
-	notify(self.State, "Removed", item.ItemName, amount, source)
+	notify(self, "Removed", item.ItemName, amount, source, true)
 	return true
 end
 

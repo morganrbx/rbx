@@ -1,6 +1,7 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
+local PolicyService = game:GetService("PolicyService")
 
 -- Player-to-player trading with a dual-confirm ("both ready") escrow flow. The
 -- server is the sole authority: it holds every live session in memory (never
@@ -25,6 +26,17 @@ local Trade = {
 	-- request to open. nil/0 means unlimited (the default, so existing games are
 	-- unaffected); set it with Trade.SetMaxRequestDistance to require proximity.
 	MaxRequestDistance = nil,
+
+	-- player -> whether PolicyService allows them to trade paid items. Populated on join
+	-- (see fetchPolicy). A player who isn't `true` here — restricted, or not yet resolved
+	-- — can't open or accept a trade, so an unreadable policy fails safe. See
+	-- Trade.IsTradingAllowed.
+	TradingAllowed = {},
+
+	-- Optional filter(itemName) -> boolean deciding which items may be offered. Items it
+	-- rejects are silently dropped from any offer. nil = everything is tradeable. Set with
+	-- Trade.SetItemFilter (a project's trade UI should hide the same items).
+	ItemFilter = nil,
 }
 
 if RunService:IsClient() then
@@ -39,6 +51,34 @@ local function getServer()
 	return require(script.Parent.Server)
 end
 
+-- Resolve and cache a player's PolicyService trading permission. Roblox requires respecting
+-- IsPaidItemTradingAllowed: some accounts (by age / region) may not trade items, and this
+-- gates the whole flow for them. Retried a few times because GetPolicyInfoForPlayerAsync
+-- yields and can transiently fail; if it still can't be read the player is left un-set, and
+-- IsTradingAllowed treats that as "not allowed" so an unreadable policy fails safe (the
+-- compliant default) rather than opening trading to someone who might be restricted.
+local function fetchPolicy(player)
+	for _ = 1, 3 do
+		local ok, info = pcall(function()
+			return PolicyService:GetPolicyInfoForPlayerAsync(player)
+		end)
+		if ok and type(info) == "table" then
+			Trade.TradingAllowed[player] = info.IsPaidItemTradingAllowed ~= false
+			return
+		end
+		if not player.Parent then
+			return
+		end
+		task.wait(3)
+	end
+end
+
+-- Whether `player` is currently permitted to trade. False until the policy resolves and
+-- false for a restricted player, so callers can gate a trade OR hide a trade button.
+function Trade.IsTradingAllowed(player)
+	return Trade.TradingAllowed[player] == true
+end
+
 -- Set the proximity requirement for opening a trade request (studs between the two
 -- players' characters). Pass nil or 0 to lift the limit. Read live per request, so
 -- it can be changed at any time.
@@ -47,6 +87,14 @@ function Trade.SetMaxRequestDistance(studs)
 	-- Replicate the current range to clients (0 = unlimited) so the trade player
 	-- list can filter to who's actually invitable and word its empty state.
 	workspace:SetAttribute("hex_trade_range", Trade.MaxRequestDistance or 0)
+end
+
+-- Restrict which items may be offered in a trade. `callback(itemName)` returns whether that
+-- item type is tradeable; items it rejects are silently dropped from any offer (see
+-- sanitizeOffer). Pass nil to allow everything. Server-authoritative — a project's trade UI
+-- should hide the same items, but this is what actually enforces it.
+function Trade.SetItemFilter(callback)
+	Trade.ItemFilter = callback
 end
 
 -- Whether `a` and `b` are close enough to trade under the current limit. With no
@@ -99,6 +147,11 @@ local function sanitizeOffer(player, raw)
 		end
 		if amount > (item.Amount or 0) then
 			return nil, "Insufficient"
+		end
+		-- Untradeable item types (Trade.SetItemFilter) are dropped from the offer rather
+		-- than blocking the whole trade, so one non-tradeable item can't jam an offer.
+		if Trade.ItemFilter and not Trade.ItemFilter(item.ItemName) then
+			continue
 		end
 		map[uuid] = amount
 	end
@@ -219,6 +272,10 @@ function Trade.request(player, target)
 	if Trade.PlayerSession[player] or Trade.PlayerSession[target] then
 		return { Success = false, Reason = "Busy" }
 	end
+	-- Either side restricted by PolicyService (IsPaidItemTradingAllowed) blocks the trade.
+	if not Trade.IsTradingAllowed(player) or not Trade.IsTradingAllowed(target) then
+		return { Success = false, Reason = "Restricted" }
+	end
 	if not withinRequestRange(player, target) then
 		return { Success = false, Reason = "TooFar" }
 	end
@@ -275,6 +332,10 @@ function Trade.respond(player, fromPlayer, accept)
 	end
 	if Trade.PlayerSession[player] or Trade.PlayerSession[fromPlayer] then
 		return { Success = false, Reason = "Busy" }
+	end
+	-- Re-check the policy on accept (in case it resolved after the invite was sent).
+	if not Trade.IsTradingAllowed(player) or not Trade.IsTradingAllowed(fromPlayer) then
+		return { Success = false, Reason = "Restricted" }
 	end
 
 	local session = {
@@ -367,6 +428,7 @@ function Trade.playerLeft(player)
 			Trade.Requests[target] = nil
 		end
 	end
+	Trade.TradingAllowed[player] = nil
 end
 
 function Trade.Start()
@@ -393,6 +455,14 @@ function Trade.Start()
 	end)
 
 	Players.PlayerRemoving:Connect(Trade.playerLeft)
+
+	-- Resolve each player's trading policy on join (and any already present).
+	Players.PlayerAdded:Connect(function(player)
+		task.spawn(fetchPolicy, player)
+	end)
+	for _, player in Players:GetPlayers() do
+		task.spawn(fetchPolicy, player)
+	end
 end
 
 return Trade

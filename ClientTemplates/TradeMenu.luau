@@ -51,6 +51,13 @@ end
 -- replicated inventory, used to populate the per-instance "add to offer" list. One
 -- entry per stack/instance (not aggregated by name), so trading references the
 -- exact uuid — preserving the instance's per-item data.
+-- Only items with a Render icon can be offered (the server enforces the same via
+-- Trade.SetItemFilter). Hiding the rest keeps blank/erroring chips out of the picker.
+local function isTradeable(itemName)
+	local info = Client.ItemTable and Client.ItemTable[itemName]
+	return info ~= nil and info.Render ~= nil and (info.Render.Image or "") ~= ""
+end
+
 local function ownedInstances()
 	local inventory = Client.Inventory
 	local list = {}
@@ -58,7 +65,7 @@ local function ownedInstances()
 		return list
 	end
 	for uuid, item in inventory:GetItems() do
-		if type(item) == "table" and item.ItemName then
+		if type(item) == "table" and item.ItemName and isTradeable(item.ItemName) then
 			table.insert(list, { ID = uuid, Item = item })
 		end
 	end

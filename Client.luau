@@ -1,5 +1,6 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 if RunService:IsServer() then
 	warn("This module is not meant to be required on the server.")
@@ -93,7 +94,14 @@ function Client:Start()
 	local Inventory = require(script.Parent.Inventory)
 
 	self:SetRemoteResponse("_GetGameInfo", function()
-		return { Items = self.ItemTable, Shops = self.ShopTable, DailyRewards = self.DailyRewardTable }
+		return {
+			Items = self.ItemTable,
+			Shops = self.ShopTable,
+			DailyRewards = self.DailyRewardTable,
+			Settings = self.SettingTable,
+			Quests = self.QuestTable,
+			Products = self.ProductTable,
+		}
 	end)
 
 	self:FireServer("_ClientReady")
@@ -105,6 +113,16 @@ function Client:Start()
 	self.ItemTable = gameInfo.Items or {}
 	self.ShopTable = gameInfo.Shops or {}
 	self.DailyRewardTable = gameInfo.DailyRewards
+	-- Developer products by id (productId -> reward list), for rendering a buy-caps menu.
+	self.ProductTable = gameInfo.Products or {}
+	-- Quest templates by name, for rendering an active quest's stages/tasks.
+	self.QuestTable = gameInfo.Quests or {}
+	-- Setting definitions in menu order, plus a name lookup (see Client:GetSetting).
+	self.SettingTable = gameInfo.Settings or {}
+	self.SettingsByName = {}
+	for _, setting in self.SettingTable do
+		self.SettingsByName[setting.Name] = setting
+	end
 
 	while workspace:GetAttribute("hex_server") ~= true do
 		task.wait()
@@ -124,6 +142,85 @@ function Client:Start()
 	end)
 
 	return true
+end
+
+-- The player's value for `name`, falling back to the definition's default when they've
+-- never set it — mirroring Server:GetSetting. Read straight from replicated state, so
+-- it's cheap and always current.
+function Client:GetSetting(name)
+	local setting = self.SettingsByName and self.SettingsByName[name]
+	if not setting then
+		return nil
+	end
+	local stored = self.Data and self.Data:Get("_Settings/" .. name)
+	if stored == nil then
+		return setting.Default
+	end
+	return stored
+end
+
+-- Change a setting. Pass nil to CLEAR the override so the player follows the default
+-- again. The server validates against the definition and can reject the value; yields on
+-- the round trip and returns true when it was applied.
+function Client:SetSetting(name, value)
+	local result = self:InvokeServer("_SetSetting", name, value)
+	return result ~= nil and result.Success == true
+end
+
+-- Clear every override, returning the player to the defaults.
+function Client:ResetSettings()
+	local result = self:InvokeServer("_ResetSettings")
+	return result ~= nil and result.Success == true
+end
+
+-- True when the player has overridden at least one setting — what the settings menu
+-- keys its "Reset" button off, so it only appears when there's something to reset.
+function Client:HasChangedSettings()
+	local stored = self.Data and self.Data:Get("_Settings")
+	return type(stored) == "table" and next(stored) ~= nil
+end
+
+-- The player's live quests, keyed by uuid — each { Template, Stage, Progress, Claimed,
+-- StageClaimed }. Read from replicated state, so it's current without a round trip; pair
+-- each with Client.QuestTable[quest.Template] for its stages and task definitions.
+function Client:GetQuests()
+	local quests = self.Data and self.Data:Get("_Quests")
+	return if type(quests) == "table" then quests else {}
+end
+
+-- The registered developer products (productId -> reward list), as declared server-side
+-- with Server:AddProducts. For rendering a buy menu; the R$ price of each isn't here (it
+-- lives on the product in Roblox) — read it with MarketplaceService:GetProductInfo if the
+-- menu wants to show it.
+function Client:GetProducts()
+	return self.ProductTable or {}
+end
+
+-- Prompt the Roblox purchase dialog for a developer product. The grant happens server-side
+-- via ProcessReceipt (Server:AddProducts) once the purchase completes — nothing to await
+-- here; the caps arrive through the normal item update.
+function Client:PromptPurchase(productId)
+	MarketplaceService:PromptProductPurchase(Players.LocalPlayer, productId)
+end
+
+-- Claim a finished task's reward. The server re-validates; yields on the round trip.
+function Client:ClaimQuestTask(questId, taskIndex)
+	local result = self:InvokeServer("_ClaimQuestTask", questId, taskIndex)
+	return result ~= nil and result.Success == true
+end
+
+-- Claim a completed stage's reward, which also advances the quest.
+function Client:ClaimQuestStage(questId)
+	local result = self:InvokeServer("_ClaimQuestStage", questId)
+	return result ~= nil and result.Success == true
+end
+
+-- The cross-server event totals (event name -> running total), fetched from the server
+-- on demand. Matches Server:GetEventTotals: the shared MemoryStore totals as of that
+-- server's last flush, plus its un-flushed batch. Yields on the round trip, so cache the
+-- result rather than calling it every frame; returns {} if the request fails.
+function Client:GetEventTotals()
+	return self:InvokeServer("_GetEventTotals") or {}
 end
 
 function Client:RenderUI()
